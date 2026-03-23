@@ -65,5 +65,13 @@ The `.venv` directory contains a pre-configured virtual environment.
 - `minst_baseline.py`: Basic MNIST training with DP-SGD using Opacus
 - `minst_adaptive.py`: MNIST training with fixed clipping threshold
 - `minst_adaptive_histogram.py`: MNIST with adaptive clipping + DP histogram tracking
-- `README.md`: Project documentation
+- `minst_adaptive_dp_manual.py`: Manual DP-SGD implementation (full control, less stable)
+- `IMPLEMENTATION_NOTES.md`: Detailed notes on adaptive clipping challenges
 - `run_results_*.pt`, `histogram_results_*.pt`, `adaptive_results_*.pt`: Saved results
+
+## Key Findings
+
+- Optimal fixed C = 0.4 achieves ~93.6% accuracy with Opacus
+- Adaptive clipping requires observing unclipped gradients (problematic with Opacus hooks)
+- Manual DP-SGD is mathematically correct but numerically unstable
+- Per-sample gradient norms follow heavy-tailed distribution
