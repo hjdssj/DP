@@ -8,20 +8,15 @@ This repository contains MNIST digit classification training scripts with differ
 
 ## Running the Scripts
 
-Both scripts accept the same arguments. Run from the `d:\DP` directory using the virtual environment:
-
 ```bash
-# Train with differential privacy (default)
-python minst_adaptive.py
+# Baseline DP-SGD (fixed C)
+python minst_baseline.py -n 10 -b 64 --sigma 1.0 -c 0.4
 
-# Train without differential privacy (baseline)
-python minst_adaptive.py --disable-dp
+# Adaptive clipping based on clipped ratio
+python minst_adaptive_histogram.py -n 10 -b 64 --sigma 1.0 -c 0.4 --target-ratio 0.3 --plot
 
-# Custom hyperparameters
-python minst_adaptive.py -n 5 -b 128 --lr 0.05 --sigma 1.5 -c 1.0
-
-# Save the trained model
-python minst_adaptive.py --save-model
+# Disable DP (baseline comparison)
+python minst_baseline.py --disable-dp
 ```
 
 Key arguments:
@@ -29,14 +24,16 @@ Key arguments:
 - `-b, --batch-size`: Batch size (default: 64)
 - `--lr`: Learning rate (default: 0.1)
 - `--sigma`: Noise multiplier for DP (default: 1.0)
-- `-c, --max-per-sample-grad_norm`: Gradient clipping norm (default: 1.0)
+- `-c, --initial-c`: Initial clipping threshold (default: 1.0)
+- `--target-ratio`: Target clipped sample ratio for adaptive C (default: 0.3 = 30%)
 - `--delta`: Target delta for DP (default: 1e-5)
 - `--disable-dp`: Disable privacy and train with vanilla SGD
-- `--save-model`: Save trained model weights to `mnist_cnn_*.pt`
+- `--save-model`: Save trained model weights
 - `--device`: Device to use, "cuda" or "cpu" (default: "cuda")
+- `--plot`: Enable histogram visualization
 - `-r, --n-runs`: Number of runs to average (default: 1)
 
-Results are saved to `run_results_*.pt` files containing accuracy per run.
+Results saved to `run_results_*.pt` and `adaptive_histogram_results_*.pt`.
 
 ## Architecture
 
@@ -46,7 +43,7 @@ Results are saved to `run_results_*.pt` files containing accuracy per run.
 - FC1: 512→32 features
 - FC2: 32→10 (digit classes)
 
-**Training**: SGD optimizer with optional Opacus PrivacyEngine wrapping for differential privacy. The privacy engine handles gradient clipping and noise addition.
+**Training**: SGD optimizer with optional Opacus PrivacyEngine wrapping for differential privacy.
 
 **Data**: MNIST dataset normalized with mean=0.1307, std=0.3081. Downloaded to `../mnist` by default.
 
@@ -57,21 +54,41 @@ Results are saved to `run_results_*.pt` files containing accuracy per run.
 - torchvision
 - numpy
 - tqdm
+- matplotlib (for visualization)
 
 The `.venv` directory contains a pre-configured virtual environment.
 
 ## File Structure
 
-- `minst_baseline.py`: Basic MNIST training with DP-SGD using Opacus
-- `minst_adaptive.py`: MNIST training with fixed clipping threshold
-- `minst_adaptive_histogram.py`: MNIST with adaptive clipping + DP histogram tracking
+- `minst_baseline.py`: Basic MNIST training with DP-SGD using Opacus (fixed C)
+- `minst_adaptive.py`: Identical to baseline (fixed C)
+- `minst_adaptive_histogram.py`: **Adaptive clipping based on clipped ratio** + histogram visualization
 - `minst_adaptive_dp_manual.py`: Manual DP-SGD implementation (full control, less stable)
 - `IMPLEMENTATION_NOTES.md`: Detailed notes on adaptive clipping challenges
-- `run_results_*.pt`, `histogram_results_*.pt`, `adaptive_results_*.pt`: Saved results
+- `histogram_plots_*/`: Generated histogram plots (when --plot enabled)
+- `run_results_*.pt`, `adaptive_histogram_results_*.pt`: Saved results
+
+## Adaptive Clipping Algorithm
+
+The `minst_adaptive_histogram.py` uses a **clipped-ratio based** adaptive method:
+
+1. Each epoch, track the fraction of samples that were clipped (norm ≥ C)
+2. If clipped_ratio > target_ratio + tolerance → increase C
+3. If clipped_ratio < target_ratio - tolerance → decrease C
+4. Otherwise → keep C stable
+
+```
+target_ratio = 30%, tolerance = 5%
+
+[0% ───────────────────────────────────────── 100%]
+   │←─────── 减小C ───────→│←── 稳定 ──→│←─────── 增大C ───────→│
+                            25%    30%    35%
+```
 
 ## Key Findings
 
-- Optimal fixed C = 0.4 achieves ~93.6% accuracy with Opacus
-- Adaptive clipping requires observing unclipped gradients (problematic with Opacus hooks)
-- Manual DP-SGD is mathematically correct but numerically unstable
+- **Optimal fixed C = 0.4** achieves ~94% accuracy with Opacus
+- Adaptive clipping converges C ≈ 0.4 when target_ratio = 30%
+- Adaptive accuracy: ~93.6% vs Fixed C=0.4: ~94.1% (nearly identical)
+- Clipped ratio adjustment is stable and effective
 - Per-sample gradient norms follow heavy-tailed distribution
