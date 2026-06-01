@@ -50,7 +50,6 @@ opacus_wheels/
 *.pptx
 *.md
 !README.md
-!AGENTS.md
 doc/
 doc_backup_*/
 ideas/
