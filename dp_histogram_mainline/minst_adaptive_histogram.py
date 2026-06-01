@@ -18,6 +18,7 @@ The adaptive strategy:
 
 import argparse
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ from adaptive_clipping import GradientHistogram, AdaptiveClipController
 # Precomputed characteristics of the MNIST dataset
 MNIST_MEAN = 0.1307
 MNIST_STD = 0.3081
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 
 class SampleConvNet(nn.Module):
@@ -72,37 +74,58 @@ def train(args, model, device, train_loader, optimizer, privacy_engine, epoch,
         loss = criterion(output, target)
         loss.backward()
 
-        # Capture TRUE (pre-clip) per-sample gradient norms from grad_sample.
-        # grad_sample is populated by Opacus after backward() but BEFORE
-        # optimizer.step() calls clip_and_accumulate(). At this point the
-        # tensors still hold the raw per-sample gradients.
-        per_sample_norms = []
-        for param in model.parameters():
-            if hasattr(param, 'grad_sample') and param.grad_sample is not None:
-                gs = param.grad_sample
-                param_norms = gs.reshape(gs.shape[0], -1).norm(2, dim=1)
-                per_sample_norms.append(param_norms)
+        if adaptive_controller is not None:
+            # Capture TRUE (pre-clip) per-sample gradient norms from grad_sample.
+            # grad_sample is populated by Opacus after backward() but BEFORE
+            # optimizer.step() calls clip_and_accumulate().
+            per_sample_norms = []
+            for param in model.parameters():
+                if hasattr(param, 'grad_sample') and param.grad_sample is not None:
+                    gs = param.grad_sample
+                    param_norms = gs.reshape(gs.shape[0], -1).norm(2, dim=1)
+                    per_sample_norms.append(param_norms)
 
-        if per_sample_norms:
-            overall_norms = torch.stack(per_sample_norms, dim=1).norm(2, dim=1)
-            histogram.set_current_c(adaptive_controller.get_c())
-            histogram.add_batch(overall_norms)
+            if per_sample_norms:
+                overall_norms = torch.stack(per_sample_norms, dim=1).norm(2, dim=1)
+                histogram.set_current_c(adaptive_controller.get_c())
+                histogram.add_batch(overall_norms)
 
         optimizer.step()
         losses.append(loss.item())
 
-    if not args.disable_dp:
-        epsilon = privacy_engine.accountant.get_epsilon(delta=args.delta)
-        print(
-            f"Train Epoch: {epoch} \t"
-            f"Loss: {np.mean(losses):.6f} "
-            f"(ε = {epsilon:.2f}, δ = {args.delta})"
-        )
-    else:
-        print(f"Train Epoch: {epoch} \t Loss: {np.mean(losses):.6f}")
+    if adaptive_controller is None:
+        if not args.disable_dp:
+            epsilon_sgd = privacy_engine.accountant.get_epsilon(delta=args.delta)
+            print(
+                f"Train Epoch: {epoch} \t"
+                f"Loss: {np.mean(losses):.6f} "
+                f"(ε_sgd={epsilon_sgd:.2f}, ε_hist=0.00, "
+                f"ε_total={epsilon_sgd:.2f}, δ={args.delta})"
+            )
+        else:
+            print(f"Train Epoch: {epoch} \t Loss: {np.mean(losses):.6f}")
+        return
 
     # Update adaptive C based on histogram (ratio or mse mode)
     new_c, old_c = adaptive_controller.update(histogram)
+
+    epsilon_sgd = 0.0
+    epsilon_hist_total = adaptive_controller.epsilon_hist_spent
+    epsilon_total = epsilon_hist_total
+    if not args.disable_dp:
+        epsilon_sgd = privacy_engine.accountant.get_epsilon(delta=args.delta)
+        epsilon_total = epsilon_sgd + epsilon_hist_total
+        print(
+            f"Train Epoch: {epoch} \t"
+            f"Loss: {np.mean(losses):.6f} "
+            f"(ε_sgd={epsilon_sgd:.2f}, ε_hist={epsilon_hist_total:.2f}, "
+            f"ε_total={epsilon_total:.2f}, δ={args.delta})"
+        )
+    else:
+        print(
+            f"Train Epoch: {epoch} \t Loss: {np.mean(losses):.6f} "
+            f"(ε_hist={epsilon_hist_total:.2f})"
+        )
 
     # --- FIX: write new C back into the optimizer so Opacus actually uses it ---
     if not args.disable_dp and hasattr(optimizer, 'max_grad_norm'):
@@ -116,12 +139,13 @@ def train(args, model, device, train_loader, optimizer, privacy_engine, epoch,
         histogram.set_bin_max(max(new_c * 2, 2.0))
 
     stats = histogram.get_stats()
-    clipped_ratio = histogram.get_clipped_ratio()
+    clipped_ratio = adaptive_controller.clipped_ratio_history[-1]
+    ratio_source = adaptive_controller.last_update_info.get('clipped_ratio_source', 'true')
 
     if adaptive_controller.mode == 'mse' and len(adaptive_controller.mse_history) > 0:
         print(
             f"  Adaptive C: {new_c:.4f} (was {old_c:.4f})"
-            f" | Clipped: {clipped_ratio:.1%}"
+            f" | Clipped: {clipped_ratio:.1%} [{ratio_source}]"
             f" | MSE={adaptive_controller.mse_history[-1]:.4f}"
             f" (bias={adaptive_controller.bias_history[-1]:.4f}"
             f" var={adaptive_controller.var_history[-1]:.4f})"
@@ -132,7 +156,8 @@ def train(args, model, device, train_loader, optimizer, privacy_engine, epoch,
     else:
         print(
             f"  Adaptive C: {new_c:.4f} (was {old_c:.4f})"
-            f" | Clipped: {clipped_ratio:.1%} (target: {args.target_ratio:.0%})"
+            f" | Clipped: {clipped_ratio:.1%} [{ratio_source}]"
+            f" (target: {args.target_ratio:.0%})"
             f" | Grad mean: {stats.get('mean', 0):.4f}"
             + (f" | optimizer.max_grad_norm={optimizer.max_grad_norm:.4f}"
                if hasattr(optimizer, 'max_grad_norm') else "")
@@ -188,8 +213,12 @@ def main():
     parser.add_argument("--data-root", type=str, default="../mnist")
     parser.add_argument("--plot", action="store_true", help="Enable histogram plotting")
     parser.add_argument("--mode", type=str, default="ratio",
-                        choices=["ratio", "mse"],
-                        help="Adaptive clipping mode: 'ratio' (clipped-ratio) or 'mse' (MSE minimization)")
+                        choices=["fixed", "ratio", "mse"],
+                        help="Clipping mode: 'fixed' (static C), 'ratio' (clipped-ratio), or 'mse' (MSE minimization)")
+    parser.add_argument("--use-dp-histogram", action="store_true",
+                        help="Use Laplace-noisy histogram queries for adaptive clipping")
+    parser.add_argument("--epsilon-hist", type=float, default=1.0,
+                        help="Per-epoch privacy budget for histogram query")
     args = parser.parse_args()
     device = torch.device(args.device)
 
@@ -230,30 +259,10 @@ def main():
         batch_size=args.test_batch_size, shuffle=True, num_workers=0, pin_memory=True,
     )
 
-    # Initialize histogram and adaptive controller
-    # MSE mode needs wider histogram to capture tail of gradient norm distribution
-    hist_bin_max = 10.0 if args.mode == 'mse' else args.initial_c * 2
-    histogram = GradientHistogram(
-        bin_min=0.0,
-        bin_max=hist_bin_max,
-        num_bins=100 if args.mode == 'mse' else 50
-    )
-    adaptive_controller = AdaptiveClipController(
-        mode=args.mode,
-        initial_c=args.initial_c,
-        target_ratio=args.target_ratio,
-        tolerance=0.05,
-        min_c=0.1,
-        max_c=10.0,
-        adjustment_speed=0.15,
-        sigma=args.sigma,
-        d=d,
-        batch_size=args.batch_size,
-    )
-
     repro_str = (
         f"mnist_adaptive_{args.mode}_{args.lr}_{args.sigma}_"
         f"{args.initial_c}_{args.batch_size}_{args.epochs}"
+        f"_hist{args.epsilon_hist if args.use_dp_histogram else 0}"
     )
     plot_dir = f"histogram_plots_{repro_str}"
     if args.plot and HAS_MATPLOTLIB:
@@ -263,26 +272,40 @@ def main():
 
     for run_idx in range(args.n_runs):
         print(f"\n=== Run {run_idx + 1}/{args.n_runs} ===")
-        print(f"Adaptive Clipping: target_ratio={args.target_ratio}, initial C={args.initial_c}")
+        if args.mode == "fixed":
+            print(f"Fixed Clipping: C={args.initial_c}")
+        else:
+            print(f"Adaptive Clipping: target_ratio={args.target_ratio}, initial C={args.initial_c}")
 
         # Reset
-        histogram.reset()
-        adaptive_controller = AdaptiveClipController(
-            mode=args.mode,
-            initial_c=args.initial_c,
-            target_ratio=args.target_ratio,
-            tolerance=0.05,
-            min_c=0.1,
-            max_c=10.0,
-            adjustment_speed=0.15,
-            sigma=args.sigma,
-            d=d,
-            batch_size=args.batch_size,
-        )
+        histogram = None
+        adaptive_controller = None
+        if args.mode in ("ratio", "mse"):
+            hist_bin_max = 10.0 if args.mode == 'mse' else args.initial_c * 2
+            histogram = GradientHistogram(
+                bin_min=0.0,
+                bin_max=hist_bin_max,
+                num_bins=100 if args.mode == 'mse' else 50
+            )
+            adaptive_controller = AdaptiveClipController(
+                mode=args.mode,
+                initial_c=args.initial_c,
+                target_ratio=args.target_ratio,
+                tolerance=0.05,
+                min_c=0.1,
+                max_c=10.0,
+                adjustment_speed=0.15,
+                sigma=args.sigma,
+                d=d,
+                batch_size=args.batch_size,
+                use_dp_histogram=args.use_dp_histogram,
+                epsilon_hist=args.epsilon_hist,
+            )
 
         model = SampleConvNet().to(device)
         optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0)
         privacy_engine = None
+        clip_c = adaptive_controller.get_c() if adaptive_controller is not None else args.initial_c
 
         if not args.disable_dp:
             privacy_engine = PrivacyEngine(secure_mode=args.secure_rng)
@@ -291,7 +314,7 @@ def main():
                 optimizer=optimizer,
                 data_loader=train_loader,
                 noise_multiplier=args.sigma,
-                max_grad_norm=adaptive_controller.get_c(),
+                max_grad_norm=clip_c,
             )
 
         for epoch in range(1, args.epochs + 1):
@@ -299,7 +322,7 @@ def main():
                   epoch, histogram, adaptive_controller)
 
             # Plot histogram every 2 epochs
-            if args.plot and HAS_MATPLOTLIB and epoch % 2 == 0:
+            if args.plot and HAS_MATPLOTLIB and adaptive_controller is not None and epoch % 2 == 0:
                 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
                 # Left plot: full histogram with log scale
@@ -342,12 +365,28 @@ def main():
         accuracy = test(model, device, test_loader)
         run_results.append(accuracy)
 
+        epsilon_sgd = 0.0
+        if not args.disable_dp:
+            epsilon_sgd = privacy_engine.accountant.get_epsilon(delta=args.delta)
+        epsilon_hist_total = (
+            adaptive_controller.epsilon_hist_spent if adaptive_controller is not None else 0.0
+        )
+        epsilon_total = epsilon_sgd + epsilon_hist_total
+
         # Final C summary
-        print(f"\nFinal adaptive C: {adaptive_controller.c:.4f}")
-        print(f"C history: {[f'{c:.3f}' for c in adaptive_controller.c_history]}")
+        if adaptive_controller is not None:
+            print(f"\nFinal adaptive C: {adaptive_controller.c:.4f}")
+            print(f"C history: {[f'{c:.3f}' for c in adaptive_controller.c_history]}")
+        else:
+            print(f"\nFinal fixed C: {args.initial_c:.4f}")
+        print(
+            f"Privacy: ε_sgd={epsilon_sgd:.4f}, "
+            f"ε_hist_total={epsilon_hist_total:.4f}, "
+            f"ε_total={epsilon_total:.4f}, δ={args.delta}"
+        )
 
         # Plot C and clipped ratio / MSE over training
-        if args.plot and HAS_MATPLOTLIB:
+        if args.plot and HAS_MATPLOTLIB and adaptive_controller is not None:
             if adaptive_controller.mode == 'mse' and len(adaptive_controller.mse_history) > 0:
                 fig, axes = plt.subplots(3, 1, figsize=(12, 12))
 
@@ -405,18 +444,47 @@ def main():
 
     save_dict = {
         'run_results': run_results,
-        'c_history': adaptive_controller.c_history,
-        'clipped_ratio_history': adaptive_controller.clipped_ratio_history,
         'mode': args.mode,
+        'use_dp_histogram': args.use_dp_histogram,
+        'epsilon_hist_per_epoch': (
+            args.epsilon_hist if args.use_dp_histogram and adaptive_controller is not None else 0.0
+        ),
+        'epsilon_hist_total': (
+            adaptive_controller.epsilon_hist_spent if adaptive_controller is not None else 0.0
+        ),
+        'epsilon_sgd': (
+            privacy_engine.accountant.get_epsilon(delta=args.delta)
+            if privacy_engine is not None and not args.disable_dp else 0.0
+        ),
+        'epsilon_total': (
+            (adaptive_controller.epsilon_hist_spent if adaptive_controller is not None else 0.0)
+            + (
+                privacy_engine.accountant.get_epsilon(delta=args.delta)
+                if privacy_engine is not None and not args.disable_dp else 0.0
+            )
+        ),
+        'histogram_query_count': (
+            adaptive_controller.histogram_query_count if adaptive_controller is not None else 0
+        ),
+        'args': vars(args),
     }
+    if adaptive_controller is not None:
+        save_dict['c_history'] = adaptive_controller.c_history
+        save_dict['clipped_ratio_history'] = adaptive_controller.clipped_ratio_history
     if args.mode == 'mse':
         save_dict['mse_history'] = adaptive_controller.mse_history
         save_dict['bias_history'] = adaptive_controller.bias_history
         save_dict['var_history'] = adaptive_controller.var_history
-    torch.save(save_dict, f"adaptive_histogram_results_{repro_str}.pt")
+        save_dict['mse_curve_history'] = adaptive_controller.mse_curve_history
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    result_path = RESULTS_DIR / f"adaptive_histogram_results_{repro_str}.pt"
+    torch.save(save_dict, result_path)
+    print(f"Saved results to {result_path}")
 
     if args.save_model:
-        torch.save(model.state_dict(), f"mnist_cnn_{repro_str}.pt")
+        model_path = RESULTS_DIR / f"mnist_cnn_{repro_str}.pt"
+        torch.save(model.state_dict(), model_path)
+        print(f"Saved model to {model_path}")
 
 
 if __name__ == "__main__":
