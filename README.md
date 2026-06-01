@@ -1,105 +1,226 @@
-# Adaptive Differential Privacy for MNIST
+# Differentially Private SGD with Adaptive Gradient Clipping
 
-MNIST digit classification with differential privacy (DP) and adaptive gradient clipping. Built with PyTorch and [Opacus](https://github.com/pytorch/opacus).
+This repository contains PyTorch and Opacus experiments for DP-SGD on MNIST,
+Fashion-MNIST, and CIFAR-10. The main focus is adaptive gradient clipping:
+instead of using one fixed clipping threshold `C` for the whole run, the scripts
+estimate the gradient norm distribution during training and update `C` between
+epochs.
 
-## Scripts
+The code supports three clipping modes:
 
-| File | Description |
-|------|-------------|
-| `minst_baseline.py` | Basic MNIST training with DP-SGD using Opacus (fixed C) |
-| `minst_adaptive_histogram.py` | **Adaptive clipping** based on clipped ratio + histogram visualization |
-| `minst_adaptive_dp_manual.py` | Manual DP-SGD implementation (full control, less stable) |
+- `fixed`: standard DP-SGD with a constant clipping threshold.
+- `ratio`: adapt `C` to keep the clipped-sample ratio near a target value.
+- `mse`: adapt `C` by minimizing an estimated clipping-noise mean squared error.
+
+Experiment outputs, checkpoints, plots, notebooks, thesis files, and work logs
+are intentionally ignored by Git. The repository is meant to track runnable
+source code and lightweight project documentation only.
+
+## Project Layout
+
+| Path | Purpose |
+|---|---|
+| `adaptive_clipping.py` | Shared histogram, ratio, and MSE clipping controller logic. |
+| `minst_baseline.py` | MNIST fixed-C DP-SGD baseline. |
+| `minst_adaptive_histogram.py` | MNIST adaptive clipping with `ratio` or `mse` mode. |
+| `fashion_mnist_*.py`, `fashionmnist_*.py` | Fashion-MNIST baselines and adaptive experiments. |
+| `cifar10_*.py` | CIFAR-10 baselines, ResNet experiments, and trade-off scripts. |
+| `run_all_experiments.py` | Batch orchestration for root-level experiments. |
+| `dp_histogram_mainline/` | Isolated mainline scripts for MSE + DP histogram experiments. |
+| `plot_*.py`, `make_*.py` | Plot and figure generation utilities. |
+
+The `dp_histogram_mainline/` directory is the cleanest place to run the current
+DP histogram version of the MSE method. It saves outputs under
+`dp_histogram_mainline/results/`, which is ignored by Git.
+
+## Setup
+
+Activate the local virtual environment before running experiments:
+
+```bash
+source .venv/Scripts/activate
+```
+
+Install the main dependencies if needed:
+
+```bash
+pip install torch torchvision opacus numpy tqdm matplotlib
+```
+
+Use `--help` on any script to confirm its current options:
+
+```bash
+python minst_adaptive_histogram.py --help
+python dp_histogram_mainline/cifar10_resnet_dp.py --help
+```
 
 ## Quick Start
 
+Fixed-C MNIST baseline:
+
 ```bash
-# Activate virtual environment
-source .venv/Scripts/activate  # Windows
-# or: source .venv/bin/activate  # Linux
-
-# Baseline DP-SGD (fixed C = 0.4, optimal)
 python minst_baseline.py -n 10 -b 64 --sigma 1.0 -c 0.4
-
-# Adaptive clipping (auto-adjusts C based on clipped ratio)
-python minst_adaptive_histogram.py -n 10 -b 64 --sigma 1.0 -c 0.4 --target-ratio 0.3 --plot
-
-# Without DP (baseline)
-python minst_baseline.py --disable-dp
 ```
 
-## Adaptive Clipping
+MNIST adaptive clipping with clipped-ratio control:
 
-The `minst_adaptive_histogram.py` implements **clipped-ratio based adaptive C**:
-
-```
-C 调整逻辑：
-
-如果 clipped_ratio > target_ratio + tolerance → 增大C
-如果 clipped_ratio < target_ratio - tolerance → 减小C
-如果在容忍范围内 → C不变
-
-target_ratio = 30%, tolerance = 5%
-
-[0% ───────────────────────────────────────── 100%]
-   │←─────── 太小 ───────→│←── 稳定 ──→│←─────── 太大 ───────→│
-                            25%    30%    35%
+```bash
+python minst_adaptive_histogram.py -n 10 -b 64 --sigma 1.0 -c 0.4 --mode ratio --target-ratio 0.3 --plot
 ```
 
-**核心思想：**
-- C太小 → 太多样本被裁剪 → bias大、noise小
-- C太大 → 太少样本被裁剪 → bias小、noise大
-- 目标：维持约30%样本被裁剪（bias-variance平衡）
+MNIST adaptive clipping with MSE control:
 
-## Key Arguments
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `-n` | Number of epochs | 10 |
-| `-b` | Batch size | 64 |
-| `--lr` | Learning rate | 0.1 |
-| `--sigma` | DP noise multiplier | 1.0 |
-| `-c, --initial-c` | Initial clipping threshold | 1.0 |
-| `--target-ratio` | Target clipped ratio (0.0-1.0) | 0.3 |
-| `--plot` | Enable histogram visualization | False |
-| `--disable-dp` | Train without DP | False |
-
-## Visualization
-
-With `--plot`, generates:
-
-```
-histogram_plots_*/
-├── epoch_002.png  # Per-epoch gradient norm distribution
-├── epoch_004.png  # Left: log scale, Right: zoomed (norm < 0.3)
-├── epoch_006.png
-├── ...
-└── run_1_summary.png  # C history + clipped ratio over epochs
+```bash
+python minst_adaptive_histogram.py -n 10 -b 64 --sigma 1.0 -c 1.0 --mode mse --plot
 ```
 
-## Results
+Fashion-MNIST ResNet18 with MSE control:
 
-| Method | C | Accuracy | ε |
-|--------|---|---------|-----|
-| Baseline (fixed C=0.4) | 0.4 | **94.08%** | 0.50 |
-| Adaptive (target 30%) | 0.40 | 93.95% | 0.50 |
-
-Adaptive clipping converges C ≈ 0.4 (optimal), achieving nearly identical accuracy.
-
-## Model Architecture
-
-SampleConvNet: 4-layer CNN
-```
-Conv1: 1→16 channels, 8×8, stride 2
-Conv2: 16→32 channels, 4×4, stride 2
-FC1: 512→32
-FC2: 32→10
+```bash
+python fashionmnist_resnet18_dp_baseline.py -n 20 -b 128 --sigma 1.0 --mode mse --initial-c 1.0
 ```
 
-## Dependencies
+CIFAR-10 ResNet with MSE control:
 
-- PyTorch
-- Opacus (`pip install opacus`)
-- torchvision
-- numpy
-- tqdm
-- matplotlib (for visualization)
+```bash
+python cifar10_resnet_dp.py -n 20 -b 1024 --max-physical-batch-size 32 --sigma 1.0 --mode mse --initial-c 1.0
+```
+
+## Clipping Methods
+
+### Fixed C
+
+`fixed` mode uses Opacus DP-SGD with a constant per-sample gradient norm bound.
+This is the standard baseline. It is simple and stable, but performance can be
+sensitive to the chosen `C`.
+
+Example:
+
+```bash
+python cifar10_resnet_dp.py -n 20 -b 1024 --sigma 1.0 --mode fixed -c 1.0
+```
+
+### Ratio-Based Adaptive C
+
+`ratio` mode measures the fraction of samples whose true per-sample gradient
+norm is above the current clipping threshold. It then updates `C` toward a
+target clipped ratio:
+
+- If too many samples are clipped, increase `C`.
+- If too few samples are clipped, decrease `C`.
+- If the ratio is within tolerance, keep `C` nearly unchanged.
+
+This method is easy to interpret and usually gives smooth threshold updates.
+
+Example:
+
+```bash
+python minst_adaptive_histogram.py -n 10 -b 64 --sigma 1.0 --mode ratio --target-ratio 0.2
+```
+
+### MSE-Based Adaptive C
+
+`mse` mode chooses `C` by estimating the bias-variance trade-off caused by
+clipping and DP noise. For candidate clipping thresholds, it estimates:
+
+```text
+MSE(C) = bias(C) + variance(C)
+
+bias(C)     = (1 / N) * sum_i max(||g_i|| - C, 0)^2
+variance(C) = sigma^2 * C^2 * d / batch_size^2
+```
+
+The bias term is approximated from a histogram of true per-sample gradient
+norms. The variance term grows with `C`, the DP noise multiplier `sigma`, and
+the model dimension `d`. The controller searches over candidate `C` values,
+selects the one with the lowest estimated MSE, then smooths the update with the
+previous threshold.
+
+This is the main method for experiments that try to balance clipping bias
+against DP noise automatically.
+
+Example:
+
+```bash
+python fashionmnist_resnet18_dp_baseline.py -n 20 -b 2048 --max-physical-batch-size 32 --sigma 1.0 --mode mse --initial-c 1.0
+```
+
+## DP Histogram Mainline
+
+The root adaptive scripts can compute the histogram directly from raw
+per-sample norms. The `dp_histogram_mainline/` scripts additionally support a
+private histogram query:
+
+```bash
+python dp_histogram_mainline/minst_adaptive_histogram.py -n 1 -b 64 --sigma 1.0 --mode mse --use-dp-histogram --epsilon-hist 0.05 --device cpu
+```
+
+With `--use-dp-histogram`, histogram counts are perturbed with Laplace noise.
+Each epoch histogram query spends `epsilon_hist`, and the scripts report the
+combined privacy accounting as:
+
+```text
+epsilon_total = epsilon_sgd + epsilon_hist_total
+```
+
+Useful mainline runners:
+
+```bash
+python dp_histogram_mainline/run_representative_experiments.py --list
+python dp_histogram_mainline/run_representative_experiments.py --dry-run
+python dp_histogram_mainline/run_full_tradeoff_sweeps.py --dataset mnist --method mse
+```
+
+After a full sweep, regenerate trade-off figures with:
+
+```bash
+python plot_tradeoff_curves.py
+```
+
+## Common Arguments
+
+| Argument | Meaning |
+|---|---|
+| `-n`, `--epochs` | Number of training epochs. |
+| `-b`, `--batch-size` | Logical batch size. |
+| `--max-physical-batch-size` | Physical batch size for memory-efficient Opacus training. |
+| `--sigma` | DP noise multiplier. |
+| `-c`, `--initial-c` or `--max-per-sample-grad-norm` | Initial or fixed clipping threshold. |
+| `--mode {fixed,ratio,mse}` | Clipping strategy, where supported by the script. |
+| `--target-ratio` | Target clipped ratio for `ratio` mode. |
+| `--use-dp-histogram` | Use noisy histogram counts in mainline scripts. |
+| `--epsilon-hist` | Privacy budget per histogram query. |
+| `--plot` | Save histogram and training summary plots when supported. |
+| `--disable-dp` | Run the non-private baseline. |
+
+## Outputs
+
+Training scripts may create `.pt`, `.csv`, `.png`, `.log`, checkpoint, and plot
+directories. These are ignored by `.gitignore` because they are experiment
+artifacts rather than source code. Typical generated paths include:
+
+```text
+run_results_*.pt
+adaptive_histogram_results_*.pt
+ckpt_*_done.pt
+experiment_results*/
+histogram_plots*/
+dp_histogram_mainline/results/
+figures/
+```
+
+Keep privacy settings explicit in output names when adding new scripts:
+include `sigma`, clipping threshold or mode, batch size, and epoch count.
+
+## Smoke Tests
+
+Use short runs before launching full experiments:
+
+```bash
+python minst_baseline.py -n 1 -b 64 --sigma 1.0 -c 0.4
+python minst_adaptive_histogram.py -n 1 -b 64 --sigma 1.0 -c 1.0 --mode mse
+python dp_histogram_mainline/minst_adaptive_histogram.py -n 1 -b 64 --sigma 1.0 --mode mse --use-dp-histogram --epsilon-hist 0.05 --device cpu
+```
+
+For smoke tests, check that training completes, `C` stays finite, and privacy
+accounting is printed when DP is enabled.
